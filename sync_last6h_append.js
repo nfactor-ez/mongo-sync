@@ -37,18 +37,28 @@ function flatten(obj, prefix = "", out = {}) {
 }
 
 async function getSheetsClient() {
-  const keyPath = path.resolve(GSA_KEY_FILE);
-  if (!fs.existsSync(keyPath)) {
-    throw new Error("Service account key file not found: " + keyPath);
+  // Prefer JSON from env (safer for cloud). Fallback to file path if provided.
+  let keyJson;
+  if (process.env.GSA_KEY_JSON) {
+    try {
+      keyJson = typeof process.env.GSA_KEY_JSON === "string"
+        ? JSON.parse(process.env.GSA_KEY_JSON)
+        : process.env.GSA_KEY_JSON;
+    } catch (e) {
+      throw new Error("GSA_KEY_JSON is not valid JSON: " + e.message);
+    }
+  } else if (process.env.GSA_KEY_FILE) {
+    const keyPath = path.resolve(process.env.GSA_KEY_FILE);
+    if (!fs.existsSync(keyPath)) throw new Error("Service account key file not found: " + keyPath);
+    keyJson = JSON.parse(fs.readFileSync(keyPath, "utf8"));
+  } else {
+    throw new Error("No service account credentials found. Set GSA_KEY_JSON or GSA_KEY_FILE.");
   }
-  const keyJson = JSON.parse(fs.readFileSync(keyPath, "utf8"));
 
-  // Use GoogleAuth directly with the credentials object
   const auth = new google.auth.GoogleAuth({
     credentials: keyJson,
     scopes: ["https://www.googleapis.com/auth/spreadsheets"]
   });
-
   const authClient = await auth.getClient();
   return google.sheets({ version: "v4", auth: authClient });
 }
