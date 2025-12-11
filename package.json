@@ -2,5 +2,12 @@
   "name": "mongo-sync",
   "version": "1.0.0",
   "type": "module",
-  "dependencies": {}
+  "scripts": {
+    "start": "node sync_last6h_append.js"
+  },
+  "dependencies": {
+    "dotenv": "^17.2.3",
+    "googleapis": "^131.0.0",
+    "mongodb": "^6.3.0"
+  }
 }
