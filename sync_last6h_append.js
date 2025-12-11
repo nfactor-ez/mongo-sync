@@ -1,4 +1,4 @@
-// sync_last6h_append.js (REPLACE ENTIRE FILE WITH THIS)
+// sync_last6h_append.js
 import { MongoClient, ObjectId } from "mongodb";
 import fs from "fs";
 import path from "path";
@@ -7,17 +7,24 @@ import { google } from "googleapis";
 
 dotenv.config();
 
+// --- Environment ---
 const {
   MONGO_URI,
   MONGO_DB = "prod",
   MONGO_COLLECTION = "ipcregistrations",
   SPREADSHEET_ID,
-  GSA_KEY_FILE,
-  SHEET_NAME = "Sheet1"
+  SHEET_NAME = "Sheet1",
+  GSA_KEY_JSON,
+  GSA_KEY_FILE
 } = process.env;
 
-if (!MONGO_URI || !SPREADSHEET_ID || !GSA_KEY_FILE) {
-  console.error("Missing required env vars. Check MONGO_URI, SPREADSHEET_ID, GSA_KEY_FILE in .env");
+// Validate required envs (accept GSA_KEY_JSON OR GSA_KEY_FILE)
+if (!MONGO_URI || !SPREADSHEET_ID || (!GSA_KEY_JSON && !GSA_KEY_FILE)) {
+  console.error("Missing required env vars.");
+  console.error("You must set:");
+  console.error("  - MONGO_URI");
+  console.error("  - SPREADSHEET_ID");
+  console.error("  - and either GSA_KEY_JSON (paste full JSON) OR GSA_KEY_FILE (path to json file)");
   process.exit(1);
 }
 
@@ -37,42 +44,55 @@ function flatten(obj, prefix = "", out = {}) {
 }
 
 async function getSheetsClient() {
-  // Prefer JSON from env var
-  if (process.env.GSA_KEY_JSON) {
-    const keyJson = JSON.parse(process.env.GSA_KEY_JSON);
+  let keyJson;
 
-    const auth = new google.auth.GoogleAuth({
-      credentials: keyJson,
-      scopes: ["https://www.googleapis.com/auth/spreadsheets"]
-    });
-
-    const authClient = await auth.getClient();
-    return google.sheets({ version: "v4", auth: authClient });
+  if (GSA_KEY_JSON) {
+    // Could be raw JSON string or already parsed object
+    try {
+      keyJson = typeof GSA_KEY_JSON === "string" ? JSON.parse(GSA_KEY_JSON) : GSA_KEY_JSON;
+    } catch (err) {
+      throw new Error("Failed to parse GSA_KEY_JSON: " + err.message);
+    }
+  } else if (GSA_KEY_FILE) {
+    const keyPath = path.resolve(GSA_KEY_FILE);
+    if (!fs.existsSync(keyPath)) throw new Error("Service account key file not found: " + keyPath);
+    try {
+      keyJson = JSON.parse(fs.readFileSync(keyPath, "utf8"));
+    } catch (err) {
+      throw new Error("Failed to read/parse key file: " + err.message);
+    }
+  } else {
+    throw new Error("No Google service account credentials found (GSA_KEY_JSON or GSA_KEY_FILE).");
   }
 
-  // Fallback (local only)
-  if (process.env.GSA_KEY_FILE) {
-    const keyPath = path.resolve(process.env.GSA_KEY_FILE);
-    const keyJson = JSON.parse(fs.readFileSync(keyPath, "utf8"));
-
-    const auth = new google.auth.GoogleAuth({
-      credentials: keyJson,
-      scopes: ["https://www.googleapis.com/auth/spreadsheets"]
-    });
-
-    const authClient = await auth.getClient();
-    return google.sheets({ version: "v4", auth: authClient });
+  // Minimal sanity check
+  if (!keyJson.client_email || !keyJson.private_key) {
+    throw new Error("Service account JSON missing client_email or private_key.");
   }
 
-  throw new Error("Neither GSA_KEY_JSON nor GSA_KEY_FILE found");
+  const auth = new google.auth.GoogleAuth({
+    credentials: keyJson,
+    scopes: ["https://www.googleapis.com/auth/spreadsheets"]
+  });
+  const authClient = await auth.getClient();
+  return google.sheets({ version: "v4", auth: authClient });
 }
 
-
 async function main() {
+  console.log("Starting sync job");
+  console.log("MONGO_DB:", MONGO_DB);
+  console.log("MONGO_COLLECTION:", MONGO_COLLECTION);
+  console.log("SHEET_NAME:", SHEET_NAME);
+  console.log("SPREADSHEET_ID present:", !!SPREADSHEET_ID);
+  console.log("Using GSA_KEY_JSON:", !!GSA_KEY_JSON, "GSA_KEY_FILE:", !!GSA_KEY_FILE);
+
   try {
     const sheets = await getSheetsClient();
-    const client = new MongoClient(MONGO_URI);
+    console.log("Authenticated with Google Sheets.");
+
+    const client = new MongoClient(MONGO_URI, { serverSelectionTimeoutMS: 10000 });
     await client.connect();
+    console.log("Connected to MongoDB.");
 
     const db = client.db(MONGO_DB);
     const coll = db.collection(MONGO_COLLECTION);
@@ -80,7 +100,7 @@ async function main() {
     const sixHoursAgo = new Date(Date.now() - 6 * 60 * 60 * 1000);
     const oidCutoff = ObjectId.createFromTime(Math.floor(sixHoursAgo.getTime() / 1000));
 
-    // Query docs from last 6 hours using ObjectId timestamp
+    console.log("Querying documents with _id >=", oidCutoff.toString());
     const cursor = coll.find({ _id: { $gte: oidCutoff } }).sort({ _id: 1 });
     const docs = await cursor.toArray();
 
@@ -89,6 +109,8 @@ async function main() {
       await client.close();
       return;
     }
+
+    console.log(`Found ${docs.length} document(s) to append.`);
 
     // Flatten docs and collect headers
     const rowsFlat = [];
@@ -111,7 +133,7 @@ async function main() {
       });
       existingHeader = (res.data.values && res.data.values[0]) || [];
     } catch (e) {
-      // If 400/404 or empty, we'll write header later
+      // ignore errors (sheet empty or not present)
       existingHeader = [];
     }
 
@@ -164,9 +186,14 @@ async function main() {
 
     console.log(`Appended ${values.length} rows to sheet.`);
     await client.close();
+    console.log("Done.");
   } catch (err) {
-    console.error("Fatal error:", err.message || err);
-    console.error(err);
+    console.error("Fatal error:", err && (err.message || String(err)));
+    if (err && err.response && err.response.data) {
+      console.error("API response:", JSON.stringify(err.response.data));
+    } else {
+      console.error(err);
+    }
     process.exit(1);
   }
 }
